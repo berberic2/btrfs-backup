@@ -1,0 +1,252 @@
+#!/usr/bin/python3
+#
+# (C) 2016 M G Berberich
+#
+# usage
+#
+# ToDo:
+# · log
+
+import subprocess, sys, os, errno
+import argparse, shlex
+
+btrfs = "/bin/btrfs"
+
+#
+# Exceptions
+#
+
+class BtrfsError(Exception):
+    """Baseclass for Btrfs-errors"""
+
+    returncode = 0
+    filesystem = ""
+
+    def __init__(self, ret, path):
+        Exception.__init__(self, ret, path)
+        self.returncode = ret
+        self.filesystem = path
+
+class NoLabelError(BtrfsError):
+    """Can not determine brtfs-label."""
+    def __str__(self):
+        return("[Return %d] Cannot determine btrfs-label: '%s'" %
+              (self.returncode, self.filesystem))
+
+class SubvolumeError(BtrfsError):
+    """Can not create subvolume."""
+
+    filesystem2 = ""
+
+    def __init__(self, ret, src, dest):
+        BtrfsError.__init__(self, ret, src)
+        self.filesystem2 = dest
+        
+    def __str__(self):
+        return("[Return %d] Cannot create subvolume: '%s'" %
+              (self.returncode, self.filesystem))
+
+class DelSubvolumeError(BtrfsError):
+    """Can not remove subvolume."""
+    def __str__(self):
+        return("[Return %d] Cannot remove subvolume: '%s'" %
+              (self.returncode, self.filesystem))
+
+#
+# Directories
+#
+
+class Directories:
+    """all directories for a backup-job"""
+    src = ""
+    dst = ""
+    label = ""
+    newsrc = ""
+    oldsrc = ""
+    newdst = ""
+    olddst = ""
+
+    def __init__(self, src, dst, label):
+        self.src = src
+        self.dst = dst
+        self.label = label
+        self.newsrc = "%s/.backup/%s/backup" % (src, self.label)
+        self.oldsrc = "%s/.backup/%s/backup-old" % (src, self.label)
+        self.newdst = "%s/backup" % dst
+        self.olddst = "%s/backup-old" % dst
+
+    def check(self):
+        return os.path.isdir(self.newsrc) and \
+            os.path.isdir(self.newdst) and \
+            not os.path.exists(self.oldsrc) and \
+            not os.path.exists(self.olddst)
+
+    def check_any(self):
+        srcbase = "%s/.backup/%s" % (self.src, self.label)
+        return os.path.exists(srcbase) or \
+            os.path.exists(self.dst)
+
+    def __str__(self):
+        return "s:%s d:%s l:%s ns:%s os:%s nd%s: od:%s" % \
+            (self.src, self.dst, self.label, self.newsrc, self.oldsrc,
+             self.newdst, self.olddst)
+
+#
+# Helperfunctions
+#
+    
+def btrfs_label(path):
+    cmd = [btrfs,  "filesystem",  "label",  path]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE)
+    if r.returncode or r.stdout == "\n":
+        raise(NoLabelError(r.returncode, path))
+    return r.stdout.decode().rstrip('\n')
+
+def create_btrfs_snapshot(src, dest):
+    cmd = [btrfs, "subvolume", "snapshot", "-r", src, dest]
+    #print("Running:", " ".join(cmd))
+    r = subprocess.run(cmd)
+    if r.returncode:
+        raise(SubvolumeError(r.returncode, src, dest))
+    
+def remove_btrfs_snapshot(path):
+    cmd = [btrfs, "subvolume", "delete", path]
+    #print("Running:", " ".join(cmd))
+    r = subprocess.run(cmd)
+    if r.returncode:
+        raise(DelSubvolumeError(r.returncode, path))
+
+def send_receive(newsrc, oldsrc, dst):
+    if oldsrc:
+        send = [btrfs, "send", "-q", "-p", oldsrc, newsrc]
+    else:
+        send = [btrfs, "send", "-q", newsrc]
+    recv = [btrfs, "receive", dst]
+    p1 = subprocess.Popen(send, stdout=subprocess.PIPE)
+    p2 = subprocess.Popen(recv, stdin=p1.stdout)
+    p1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
+    r2 = p2.wait()
+    r1 = p1.wait()
+    if r1:
+        raise subprocess.CalledProcessError(p1.returncode, send)
+    if r2:
+        raise subprocess.CalledProcessError(p2.returncode, recv)
+
+#
+# Backup
+#
+
+def backup(dirs):
+    print("##\n# Backup from '%s' to '%s/%s' with label '%s'\n##" %
+          (dirs.src, os.getcwd(), dirs.dst, dirs.label))
+    
+    os.rename(dirs.newsrc, dirs.oldsrc)
+    create_btrfs_snapshot(dirs.src, dirs.newsrc)
+    os.rename(dirs.newdst, dirs.olddst)
+    send_receive(dirs.newsrc, dirs.oldsrc, dirs.dst)
+    remove_btrfs_snapshot(dirs.oldsrc)
+    remove_btrfs_snapshot(dirs.olddst)
+
+
+#
+# Setup
+#
+        
+def setup(dirs):
+    print("##\n# Setup of '%s' to '%s/%s' with label '%s'\n##" %
+          (dirs.src, os.getcwd(), dirs.dst, dirs.label))
+    if dirs.check():
+        print("Already set up")
+        return
+    if dirs.check_any():
+        print("Error: Not setting up, at least parts are existing")
+        return
+    print("setting up")
+    os.makedirs("%s/.backup/" % dirs.src, exist_ok=True)
+    os.makedirs("%s/.backup/%s" % (dirs.src, dirs.label))
+    create_btrfs_snapshot(dirs.src, dirs.newsrc)
+    os.makedirs(dirs.dst)
+    send_receive(dirs.newsrc, None, dirs.dst)
+
+#
+# Main
+#
+
+# process arguments
+parser = argparse.ArgumentParser(description="make a backup")
+parser.add_argument("path", help="path to the backup", nargs="?")
+parser.add_argument("-i", "--init", help="create initial structure",
+                    action="store_true" )
+parser.add_argument("-n", help="read and print config, do nothing",
+                    action="store_true" )
+args = parser.parse_args()
+
+try:
+    if args.path:
+        os.chdir(args.path)
+
+    # check for config
+    if not os.path.exists('./backup-config'):
+        print("Error: Can’t find 'backup-config' in '%s'" % os.getcwd())
+        exit(1)
+    
+    # parse config
+    jobs = []
+    label = None
+    linenr = 0
+    for line in open('./backup-config'):
+        linenr += 1
+        if line[0] in '#\n': continue
+        a = shlex.split(line)
+        if a[0] == "Label:" and len(a) == 2:
+            label = a[1]
+            continue
+        if len(a) == 2:
+            if not label:
+                print("Error: Missing label statement in config at line %d" %
+                      linenr)
+                exit(4)
+            jobs.append(Directories(a[0], a[1], label))
+        else:
+            print("Error: Strange line in config at line %d" % linenr)
+            exit(4)
+            
+
+
+    if args.n:
+        print("Read config:") 
+        for i in jobs:
+            print("backup from '%s' to '%s' with label %s" %
+                  (i.src, i.dst, i.label))
+            if not i.check_any():
+                print("  Not yet set up")
+            elif not i.check():
+                print("  directory-structure-problem")
+        exit(0)
+        
+    if args.init:
+        for i in jobs:
+            setup(i)
+            if not i.check():
+                print("Error: directory-structure-problem")
+                exit(3)
+        exit(0)
+        
+    for i in jobs:
+        if not i.check():
+            print("Error: directory-structure-problem")
+            exit(3)
+        # backups
+        backup(i)
+
+except OSError as err:
+    print(err)
+    exit(1)
+
+except BtrfsError as err:
+    print("Error Btrfs:", err)
+    exit(1)
+
+except subprocess.SubprocessError as err:
+    print("Error subprocess:", err)
+    exit(1)

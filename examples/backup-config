@@ -1,0 +1,8 @@
+# lines starting with ‘#’ are comments
+# define a label before the first backup
+#
+Label: Backup-Data-1
+# backup /home to backup-home here
+/home backup-home
+# backup /data too
+/data backup-data
