@@ -7,8 +7,8 @@
 # ToDo:
 # · log
 
-import subprocess, sys, os, errno
-import argparse, shlex
+import subprocess, sys, os, errno, time
+import argparse, shlex, syslog
 
 btrfs = "/bin/btrfs"
 
@@ -94,7 +94,20 @@ class Directories:
 #
 # Helperfunctions
 #
-    
+
+def eprint(message, prio=syslog.LOG_INFO, header=False):
+    if header:
+        print("##\n# %s\n##" % message)
+    else:
+        print(message)
+    syslog.syslog(prio, message)
+    file = open("btrfs-backup.log", "a")
+    print(time.strftime("%F %T %Z"), message, file=file)
+    file.close()
+
+def errprint(message):
+    eprint("error: %s" % message, prio=syslog.LOG_ERR)
+
 def btrfs_label(path):
     cmd = [btrfs,  "filesystem",  "label",  path]
     r = subprocess.run(cmd, stdout=subprocess.PIPE)
@@ -137,8 +150,9 @@ def send_receive(newsrc, oldsrc, dst):
 #
 
 def backup(dirs):
-    print("##\n# Backup from '%s' to '%s/%s' with label '%s'\n##" %
-          (dirs.src, os.getcwd(), dirs.dst, dirs.label))
+    info_str = "from '%s' to '%s/%s' with label '%s'" % \
+               (dirs.src, os.getcwd(), dirs.dst, dirs.label)
+    eprint("backup %s" % info_str)
     
     os.rename(dirs.newsrc, dirs.oldsrc)
     create_btrfs_snapshot(dirs.src, dirs.newsrc)
@@ -147,6 +161,7 @@ def backup(dirs):
     remove_btrfs_snapshot(dirs.oldsrc)
     remove_btrfs_snapshot(dirs.olddst)
 
+    eprint("end %s" % info_str)
 
 #
 # Setup
@@ -182,12 +197,15 @@ parser.add_argument("-n", help="read and print config, do nothing",
 args = parser.parse_args()
 
 try:
+    syslog.openlog("btrfs-backup", syslog.LOG_INFO, syslog.LOG_USER)
+    eprint("starting btrfs-backup run", header=True)
+
     if args.path:
         os.chdir(args.path)
 
     # check for config
     if not os.path.exists('./backup-config'):
-        print("Error: Can’t find 'backup-config' in '%s'" % os.getcwd())
+        errprint("can’t find 'backup-config' in '%s'" % os.getcwd())
         exit(1)
     
     # parse config
@@ -203,23 +221,23 @@ try:
             continue
         if len(a) == 2:
             if not label:
-                print("Error: Missing label statement in config at line %d" %
+                errprint("Missing label statement in config at line %d" %
                       linenr)
                 exit(4)
             jobs.append(Directories(a[0], a[1], label))
         else:
-            print("Error: Strange line in config at line %d" % linenr)
+            errprint("strange line in config at line %d" % linenr)
             exit(4)
             
 
 
     if args.n:
-        print("Read config:") 
+        print("read config:") 
         for i in jobs:
             print("backup from '%s' to '%s' with label %s" %
                   (i.src, i.dst, i.label))
             if not i.check_any():
-                print("  Not yet set up")
+                print("  not yet set up")
             elif not i.check():
                 print("  directory-structure-problem")
         exit(0)
@@ -228,25 +246,27 @@ try:
         for i in jobs:
             setup(i)
             if not i.check():
-                print("Error: directory-structure-problem")
+                errprint("  directory-structure-problem")
                 exit(3)
         exit(0)
         
     for i in jobs:
         if not i.check():
-            print("Error: directory-structure-problem")
+            errprint("  directory-structure-problem")
             exit(3)
         # backups
         backup(i)
 
+    syslog.closelog()
+
 except OSError as err:
-    print(err)
+    errprint(err)
     exit(1)
 
 except BtrfsError as err:
-    print("Error Btrfs:", err)
+    errprint("Btrfs: %" % err)
     exit(1)
 
 except subprocess.SubprocessError as err:
-    print("Error subprocess:", err)
+    errprint("subprocess: %s" % err)
     exit(1)
